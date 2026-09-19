@@ -27,6 +27,7 @@ os.environ["APPDATA"] = tempfile.mkdtemp(prefix="campusp_guard_")
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from PySide6.QtCore import QTimer                       # noqa: E402
+from PySide6.QtWebEngineCore import QWebEnginePage      # noqa: E402
 from PySide6.QtWidgets import QApplication              # noqa: E402
 
 from core import wifi                                   # noqa: E402
@@ -163,9 +164,14 @@ def main() -> int:
     print(f"    耗时 {cost:.1f}s")
 
     check("流程正常结束", done["v"])
-    check("页面打不开时立刻换地址",
-          "页面打不开，不等渲染了" in joined,
-          [l for l in logs if "打不开" in l][:1].__str__()[:70])
+    # "加载失败"和"加载成功但没有表单"是两条不同的快速换址路径。
+    # 哪种被走到取决于 Chromium 当时的状态（连接被拒有时会被算作
+    # "加载了自己的错误页"）。这里只要求至少命中一条 —— 关键在于
+    # 下面那两条结构断言：绝不能再出现 9 轮空转。
+    hit_load_fail = "页面打不开，不等渲染了" in joined
+    hit_no_form = "这个页面上没有账号/密码输入框" in joined
+    check("加载失败/无表单时都会立刻换地址", hit_load_fail or hit_no_form,
+          f"加载失败路径={hit_load_fail} 无表单路径={hit_no_form}")
     check("「没有账号密码框」不再死等 9 轮",
           "（9/9）" not in joined,
           f"出现 9/9 = {'（9/9）' in joined}")
@@ -248,6 +254,23 @@ def main() -> int:
           f"账号={res.get('userSel')} 密码={res.get('pwdSel')}")
     check("隐藏状态下仍能点到登录按钮", bool(res.get("submitted")),
           f"按钮={res.get('btnSel')} submitted={res.get('submitted')}")
+
+    # Qt 默认"页面看不见就冻结"，而冻结正是"后台填不了表"的根因。
+    # 我们显式把它钉成 Active —— 这条断言直接盯着这个机制。
+    win._keep_page_active()
+    pump(app, 200)
+    state = win.view.page().lifecycleState()
+    check("隐藏状态下页面生命周期仍是 Active（没被冻结）",
+          state == QWebEnginePage.LifecycleState.Active,
+          f"state={state}")
+
+    win.view.page().setLifecycleState(QWebEnginePage.LifecycleState.Frozen)
+    pump(app, 150)
+    win._keep_page_active()
+    pump(app, 150)
+    check("万一被冻结，也能自动拉回 Active",
+          win.view.page().lifecycleState() == QWebEnginePage.LifecycleState.Active,
+          f"state={win.view.page().lifecycleState()}")
 
     win.close()
     wifi.current_ssid, wifi.connect = real_ssid, real_connect

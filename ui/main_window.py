@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QSizePolicy, QApplication, QFrame, QScrollArea,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEnginePage
 
 from core.autofill import build_background_js
 from core.config import (ConfigManager, APP_TITLE, APP_VERSION, AUTHOR,
@@ -1304,10 +1305,23 @@ class MainWindow(QMainWindow):
 
     def _do_init_browser(self):
         t0 = time.time()
+        page = None
         try:
-            self.view.page().setBackgroundColor(QColor(self._palette.get("bg", "#262a31")))
+            page = self.view.page()
+            page.setBackgroundColor(QColor(self._palette.get("bg", "#262a31")))
         except Exception:
             pass
+        # Qt 会在页面不可见时把它冻结（生命周期降到 Frozen）——
+        # 而本程序大量时间缩在托盘里，或者用户干脆关掉了预览页。
+        # 一冻结，认证页那个单页应用就渲染不完：账号密码框有了、
+        # "登录"按钮却迟迟不出现，看着就像"必须手动点一下登录"。
+        # 显式钉成 Active，比依赖命令行参数透传可靠得多。
+        if page is not None:
+            try:
+                page.setLifecycleState(QWebEnginePage.LifecycleState.Active)
+                self.append_log("已把浏览器页面钉为活跃状态（后台也能渲染表单）")
+            except Exception:
+                pass
         self._browser_ready = True
         self._browser_starting = False
         self.append_log(f"浏览器就绪（用时 {time.time() - t0:.1f}s）")
@@ -1316,6 +1330,24 @@ class MainWindow(QMainWindow):
         fn, self._pending_browser_action = self._pending_browser_action, None
         if fn:
             QTimer.singleShot(0, fn)
+
+    def _keep_page_active(self):
+        """页面被隐藏时，确认它没被冻结。
+
+        Qt 默认"看不见就冻结"，对普通网页没问题，对我们这种
+        "必须让它在后台把表单渲染完"的用法是致命的。
+        """
+        if not getattr(self, "_browser_ready", False):
+            return False
+        try:
+            page = self.view.page()
+            if page.lifecycleState() != QWebEnginePage.LifecycleState.Active:
+                page.setLifecycleState(QWebEnginePage.LifecycleState.Active)
+                self.append_log("检测到浏览器页面被冻结，已重新激活")
+                return True
+        except Exception:
+            pass
+        return False
 
     def _start_engine(self, reason: str, submit: bool = True, auto: bool = False):
         """启动一次认证流程。
@@ -1331,6 +1363,8 @@ class MainWindow(QMainWindow):
                 return
             if not self._wifi_preflight(reason):
                 return
+        # 每次真要干活之前，确认页面没被 Qt 冻结
+        self._keep_page_active()
         self._ensure_browser(lambda: self.engine.start(reason, submit))
 
     # ==================== 无线网络触发 ====================
