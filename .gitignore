@@ -1,0 +1,42 @@
+# ============ 打包产物（体积大，可用 build.py 重新生成）============
+/dist/
+/build/
+校园网自动连接/
+校园网自动连接-*.zip
+assets/app.ico
+
+# ============ 开发过程产物 ============
+
+# 离线安装用的 wheel 包（约 240MB）
+/_wheels/
+
+# 界面截图，含运行时的账号等信息
+/_shots/
+
+# 抓取的真实 portal 页面与脚本，含学校相关信息
+/_debug/
+
+_smoke.log
+
+# ============ 本地工作数据 ============
+.workbuddy/
+
+# ============ 运行数据（含账号密码，绝不能进仓库）============
+config.json
+*.log
+
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ============ 编辑器 / 系统 ============
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+Desktop.ini

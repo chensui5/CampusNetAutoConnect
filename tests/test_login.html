@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>模拟校园网认证页</title>
+<style>
+  body { background: #eef2f7; font-family: "Microsoft YaHei", sans-serif; padding: 40px; }
+  .box { width: 360px; margin: 0 auto; background: #fff; padding: 24px; border-radius: 10px;
+         box-shadow: 0 6px 20px rgba(0,0,0,.08); }
+  input { width: 100%; padding: 9px; margin: 8px 0; box-sizing: border-box; }
+  button { width: 100%; padding: 10px; background: #2563eb; color: #fff; border: none; border-radius: 6px; }
+  #result { margin-top: 14px; font-weight: bold; color: #12a06a; }
+</style>
+</head>
+<body>
+<div class="box">
+  <h3>校园网认证</h3>
+  <form id="loginForm" onsubmit="return doLogin()">
+    <input id="username" name="userAccount" type="text" placeholder="请输入学号">
+    <input id="password" name="userPassword" type="password" placeholder="请输入密码">
+    <label><input type="checkbox" id="remember"> 记住我</label>
+    <button type="submit" id="loginBtn">登 录</button>
+    <input type="reset" value="重置">
+  </form>
+  <div id="result">pending</div>
+</div>
+<script>
+function doLogin() {
+  var u = document.getElementById('username').value;
+  var p = document.getElementById('password').value;
+  var r = document.getElementById('remember').checked;
+  document.getElementById('result').innerText =
+      'LOGIN_OK|user=' + u + '|pwd=' + p + '|remember=' + r;
+  return false;
+}
+</script>
+</body>
+</html>
