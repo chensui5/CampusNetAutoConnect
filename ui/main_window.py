@@ -74,6 +74,7 @@ class MainWindow(QMainWindow):
         self._last_ssid = None
         self._last_wifi_probe = 0.0
         self._last_trigger_time = 0.0
+        self._trigger_ssid = ""
         self._wifi_probe_worker = None
         self.wifi_timer = QTimer(self)
         self.wifi_timer.timeout.connect(self._wifi_tick)
@@ -101,6 +102,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_tray()
         self.sync_from_cfg()
+        # 到这为止界面才算能读；在此之前触发的自动保存不该去收集界面状态
+        self._ui_ready = True
         # 程序被移动/改名过的话，把开机自启项修正到当前位置（否则开机没反应）
         try:
             fixed, note = autostart.repair_if_stale()
@@ -584,7 +587,21 @@ class MainWindow(QMainWindow):
         self.sp_wifi_wait.setRange(0, 60)
         self.sp_wifi_wait.setSuffix(" 秒")
         self.lbl_wifi = self._label("检测中…", "muted", 11)
+
+        # 自动识别校园网：不用手填名字，程序自己认
+        self.cb_wifi_auto = NeuCheckBox("自动识别校园网（认过一次就记住）")
+        known_row = QWidget()
+        kr = QHBoxLayout(known_row)
+        kr.setContentsMargins(0, 0, 0, 0)
+        kr.setSpacing(12)
+        self.lbl_known = self._label("尚未识别到，连上一次就会记住", "muted", 11)
+        self.btn_clear_known = NeuButton("清空", compact=True)
+        kr.addWidget(self.lbl_known, 1)
+        kr.addWidget(self.btn_clear_known)
+
         l5.addWidget(self.cb_wifi)
+        l5.addWidget(self.cb_wifi_auto)
+        l5.addWidget(self._field("已识别的校园网", known_row))
         l5.addWidget(self._field("无线网络名", ssid_row))
         l5.addWidget(self._field("检查间隔", self.sp_wifi_interval))
         l5.addWidget(self._field("连上后等待", self.sp_wifi_wait))
@@ -646,6 +663,9 @@ class MainWindow(QMainWindow):
                   self.sp_timeout, self.sp_wait, self.sp_probe_timeout):
             x.valueChanged.connect(lambda _: self._dirty())
         self.btn_ssid_now.clicked.connect(self._use_current_ssid)
+        self.cb_wifi_auto.toggled.connect(
+            lambda _: (self._dirty(), self._refresh_known_ssids()))
+        self.btn_clear_known.clicked.connect(self._clear_known_ssids)
         self.cb_wifi.toggled.connect(lambda _: (self._dirty(), self._apply_wifi_watch()))
         self.sp_wifi_interval.valueChanged.connect(lambda _: (self._dirty(), self._apply_wifi_watch()))
         self.sp_wifi_wait.valueChanged.connect(lambda _: self._dirty())
@@ -798,6 +818,7 @@ class MainWindow(QMainWindow):
         self.sp_probe_timeout.setValue(s.probe_timeout)
         self.cb_skip.setChecked(s.skip_if_online)
         self.cb_wifi.setChecked(s.wifi_trigger_enabled)
+        self.cb_wifi_auto.setChecked(s.wifi_auto_detect)
         self.ed_ssid.setText(s.wifi_ssid)
         self.sp_wifi_interval.setValue(s.wifi_check_interval)
         self.sp_wifi_wait.setValue(s.wifi_wait)
@@ -818,9 +839,17 @@ class MainWindow(QMainWindow):
         self.lbl_bg_path.setText(os.path.basename(s.bg_file) if s.bg_file else "未选择")
         {"dark": self.rb_dark, "light": self.rb_light,
          "system": self.rb_system}.get(s.theme, self.rb_light).setChecked(True)
+        self._refresh_known_ssids()
         self._blocked = False
 
-    def save_from_ui(self, force=False):
+    def collect_from_ui(self) -> None:
+        """把界面上的当前状态收进配置对象（只收集，不落盘、不排定时器）。
+
+        以前只有【保存配置】按钮会收集界面状态，而勾选框/输入框的改动走的是
+        自动保存（_dirty → 定时器 → _do_save），_do_save 直接把内存里那份**旧**配置
+        写盘 —— 于是出现"勾上『启动后自动连接』，重启后又变回没勾"。
+        现在 _do_save 每次落盘前都会先调这里。
+        """
         s = self.s
         s.url = self.ed_url.text().strip()
         s.username = self.ed_user.text().strip()
@@ -841,6 +870,8 @@ class MainWindow(QMainWindow):
         s.skip_if_online = self.cb_skip.isChecked()
         s.wifi_trigger_enabled = self.cb_wifi.isChecked()
         s.wifi_ssid = self.ed_ssid.text().strip()
+        s.wifi_auto_detect = self.cb_wifi_auto.isChecked()
+        # 注意：wifi_known_ssids 由 _learn_ssid() 直接维护，界面上没有对应控件
         s.wifi_check_interval = self.sp_wifi_interval.value()
         s.wifi_wait = self.sp_wifi_wait.value()
         s.sel_username = self.ed_sel_user.text().strip()
@@ -854,7 +885,11 @@ class MainWindow(QMainWindow):
         s.bg_dim = self.sl_dim.value()
         s.bg_blur = self.sl_blur.value()
         s.bg_fit = self.cb_fit.currentData() or "cover"
+        s.auto_start = self.cb_autostart.isChecked()
         s.first_run = False
+
+    def save_from_ui(self, force=False):
+        self.collect_from_ui()
         if force:
             self._do_save()
         else:
@@ -875,6 +910,12 @@ class MainWindow(QMainWindow):
         self._dirty()
 
     def _do_save(self):
+        # 落盘前先收一遍界面状态 —— 自动保存也必须反映用户刚才的改动
+        if getattr(self, "_ui_ready", False):
+            try:
+                self.collect_from_ui()
+            except Exception:
+                pass
         if self.cfg.save():
             self.watchdog.setInterval(max(10, self.s.reconnect_interval) * 1000)
             self._apply_wifi_watch()
@@ -1119,6 +1160,10 @@ class MainWindow(QMainWindow):
         if ok and self.s.close_page_after_success:
             self.view.setUrl(QUrl("about:blank"))
         if ok:
+            # 认证成功 —— 这就是校园网，把它的名字记下来，下次不用再猜
+            if getattr(self, "_trigger_ssid", ""):
+                self._learn_ssid(self._trigger_ssid, "认证成功")
+                self._trigger_ssid = ""
             self.tray.showMessage(APP_TITLE, f"校园网已连接：{msg}",
                                   QSystemTrayIcon.Information, 2500)
         else:
@@ -1271,12 +1316,102 @@ class MainWindow(QMainWindow):
         self._flush()
         self.append_log(f"已把「{ssid}」设为触发用的无线网络")
 
+    # ---------- 自动识别校园网 ----------
+    def _auto_detect_on(self) -> bool:
+        """自动识别开关 —— 以界面为准。
+
+        配置对象要等自动保存（600ms 防抖）才会更新，直接读 s 会慢半拍，
+        出现"刚取消勾选，程序又记了一个名字"这种别扭事。
+        """
+        if hasattr(self, "cb_wifi_auto"):
+            return bool(self.cb_wifi_auto.isChecked())
+        return bool(getattr(self.s, "wifi_auto_detect", True))
+
+    def _manual_ssid(self) -> str:
+        """手填的无线网络名 —— 同样以界面为准。"""
+        if hasattr(self, "ed_ssid"):
+            return (self.ed_ssid.text() or "").strip()
+        return (self.s.wifi_ssid or "").strip()
+
+    def _wifi_targets(self) -> set:
+        """当前"该管"的无线网络集合（小写）。
+
+        来源有两处：手填的无线网络名 + 自动识别记下来的那些。
+        两边都为空时返回空集合，含义是"任何无线网络都试一下"。
+        """
+        t = set()
+        manual = self._manual_ssid().lower()
+        if manual:
+            t.add(manual)
+        if self._auto_detect_on():
+            for x in (self.s.wifi_known_ssids or []):
+                x = str(x).strip().lower()
+                if x:
+                    t.add(x)
+        return t
+
+    def _accept_ssid(self, ssid: str) -> bool:
+        """这个无线网络要不要管？"""
+        t = self._wifi_targets()
+        if not t:
+            return True      # 还没认出任何校园网 → 先都试试，靠"能不能上网"判断
+        return ssid.strip().lower() in t
+
+    def _learn_ssid(self, ssid: str, why: str = "") -> None:
+        """记住这个无线网络需要认证，以后连上就自动处理。"""
+        ssid = (ssid or "").strip()
+        if not ssid or not self._auto_detect_on():
+            return
+        known = [str(x).strip() for x in (self.s.wifi_known_ssids or [])]
+        if any(x.lower() == ssid.lower() for x in known):
+            return
+        known.append(ssid)
+        self.s.wifi_known_ssids = known
+        self._refresh_known_ssids()
+        self._dirty()
+        suffix = f"（{why}）" if why else ""
+        self.append_log(f"已识别出校园网「{ssid}」{suffix}，以后连上它就自动认证")
+
+    def _forget_ssid(self, ssid: str) -> None:
+        known = [str(x).strip() for x in (self.s.wifi_known_ssids or [])]
+        left = [x for x in known if x.lower() != (ssid or "").strip().lower()]
+        if len(left) != len(known):
+            self.s.wifi_known_ssids = left
+            self._refresh_known_ssids()
+            self._dirty()
+
+    def _clear_known_ssids(self):
+        if not (self.s.wifi_known_ssids or []):
+            self.set_status("还没有识别到任何校园网")
+            return
+        self.s.wifi_known_ssids = []
+        self._refresh_known_ssids()
+        self._flush()
+        self.append_log("已清空识别记录，下次连上校园网会重新识别")
+
+    def _refresh_known_ssids(self):
+        if not hasattr(self, "lbl_known"):
+            return
+        known = [str(x).strip() for x in (self.s.wifi_known_ssids or []) if str(x).strip()]
+        if not self._auto_detect_on():
+            self.lbl_known.setText("自动识别已关闭")
+        elif known:
+            self.lbl_known.setText("、".join(known))
+        else:
+            manual = self._manual_ssid()
+            self.lbl_known.setText(
+                f"尚未识别（暂按手填的「{manual}」判断）" if manual
+                else "尚未识别到，连上一次就会记住")
+
     def _wifi_tick(self):
         """每几秒看一眼无线网络。
 
+        管哪些网络？手填的「无线网络名」+ 自动识别记下来的那些；
+        两边都没配置时，任何无线网络都试（靠"能不能上网"来判定）。
+
         两种情况都会触发认证：
-          1. 刚连上目标无线网络（响应最快）
-          2. 一直连着的目标网络其实上不了网（手动断开重连太快时，光看 SSID 变化会漏掉）
+          1. 刚连上该管的网络（响应最快）
+          2. 一直连着的网络其实上不了网（手动断开重连太快时，光看 SSID 变化会漏掉）
         """
         if not getattr(self, "_has_wifi", False):
             return
@@ -1291,8 +1426,7 @@ class MainWindow(QMainWindow):
         if not ssid:
             self._last_ssid = ""
             return
-        target = (self.s.wifi_ssid or "").strip().lower()
-        if target and ssid.lower() != target:
+        if not self._accept_ssid(ssid):
             self._last_ssid = ssid
             return
 
@@ -1316,9 +1450,26 @@ class MainWindow(QMainWindow):
             lambda ok, d, name=ssid: self._on_wifi_probe(ok, d, name))
         self._wifi_probe_worker.start()
 
+    @staticmethod
+    def _looks_like_portal(detail: str) -> bool:
+        """网络不通的原因，像不像"被认证页劫持"（而不是单纯断网）。
+
+        校园网的典型表现是 302 跳转、或 200 但内容不对；
+        单纯断网一般是超时 / 域名解析失败 / 连接被拒。
+        只有像认证页劫持才值得记下这个网络名。
+        """
+        t = (detail or "").lower()
+        if any(k in t for k in ("超时", "timeout", "解析", "dns", "拒绝",
+                                "refused", "unreachable", "没有到主机的路由")):
+            return False
+        return ("302" in t) or ("301" in t) or ("劫持" in detail) or ("未匹配" in detail)
+
     def _on_wifi_probe(self, online: bool, detail: str, ssid: str):
         if online:
             return
+        # 连上了却上不了网，而且像是被劫持到认证页 —— 这就是校园网，把名字记下来
+        if self._looks_like_portal(detail):
+            self._learn_ssid(ssid, "连上了但被拦到认证页")
         if self.engine.busy or not self.s.wifi_trigger_enabled:
             return
         cooldown = 30
@@ -1347,6 +1498,7 @@ class MainWindow(QMainWindow):
             self.append_log("还没配置认证页地址，跳过自动认证")
             return
         self.append_log(f"开始自动认证（触发来源：{ssid}）")
+        self._trigger_ssid = ssid          # 成功后拿它去记名
         self._start_engine(f"WiFi 触发（{ssid}）")
 
     # ==================== 后台守护 ====================

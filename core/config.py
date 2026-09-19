@@ -17,7 +17,7 @@ from .crypto import protect_text, unprotect_text
 
 APP_NAME = "CampusNetAutoConnect"
 APP_TITLE = "校园网自动连接"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 AUTHOR = "尘遂"
 
 
@@ -59,6 +59,8 @@ class Settings:
     # —— 无线网络触发（连上指定 WiFi 后自动认证）——
     wifi_trigger_enabled: bool = True   # 连上指定无线网络后自动认证
     wifi_ssid: str = ""                 # 目标 WiFi 名（留空=任意无线网络）
+    wifi_auto_detect: bool = True       # 自动识别校园网：检测到需要认证的网络就记下名字
+    wifi_known_ssids: list = field(default_factory=list)  # 已识别出的校园网名
     wifi_check_interval: int = 4        # 检查间隔（秒）
     wifi_net_check_interval: int = 15   # 网络是否可用的复查间隔（秒）
     wifi_wait: int = 3                  # 连上后等多久再认证（等 DHCP）
