@@ -18,6 +18,10 @@ WLAN_INTERFACE_STATE_CONNECTED = 1
 WLAN_INTF_OPCODE_CURRENT_CONNECTION = 7
 WLAN_CLIENT_VERSION = 2
 
+# —— 连接用到的常量 ——
+WLAN_CONNECTION_MODE_PROFILE = 0        # 按已保存的配置文件连
+DOT11_BSS_TYPE_ANY = 3                  # 不限定基础设施/自组网
+
 
 class GUID(ctypes.Structure):
     _fields_ = [("Data1", ctypes.c_ulong),
@@ -84,6 +88,26 @@ class WLAN_CONNECTION_ATTRIBUTES(ctypes.Structure):
                 ("wlanSecurityAttributes", WLAN_SECURITY_ATTRIBUTES)]
 
 
+class WLAN_PROFILE_INFO(ctypes.Structure):
+    _fields_ = [("strProfileName", ctypes.c_wchar * 256),
+                ("dwFlags", ctypes.c_ulong)]
+
+
+class WLAN_PROFILE_INFO_LIST(ctypes.Structure):
+    _fields_ = [("dwNumberOfItems", ctypes.c_ulong),
+                ("dwIndex", ctypes.c_ulong),
+                ("ProfileInfo", WLAN_PROFILE_INFO * 1)]
+
+
+class WLAN_CONNECTION_PARAMETERS(ctypes.Structure):
+    _fields_ = [("wlanConnectionMode", ctypes.c_uint),
+                ("strProfile", ctypes.c_wchar_p),
+                ("pDot11Ssid", ctypes.POINTER(DOT11_SSID)),
+                ("pDesiredBssidList", ctypes.c_void_p),
+                ("dot11BssType", ctypes.c_uint),
+                ("dwFlags", wintypes.DWORD)]
+
+
 if _wlanapi is not None:
     _wlanapi.WlanOpenHandle.argtypes = [
         wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD),
@@ -102,6 +126,14 @@ if _wlanapi is not None:
     _wlanapi.WlanQueryInterface.restype = wintypes.DWORD
     _wlanapi.WlanFreeMemory.argtypes = [ctypes.c_void_p]
     _wlanapi.WlanFreeMemory.restype = None
+    _wlanapi.WlanGetProfileList.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(GUID), ctypes.c_void_p,
+        ctypes.POINTER(ctypes.POINTER(WLAN_PROFILE_INFO_LIST))]
+    _wlanapi.WlanGetProfileList.restype = wintypes.DWORD
+    _wlanapi.WlanConnect.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(GUID),
+        ctypes.POINTER(WLAN_CONNECTION_PARAMETERS), ctypes.c_void_p]
+    _wlanapi.WlanConnect.restype = wintypes.DWORD
 
 
 def available() -> bool:
@@ -182,6 +214,115 @@ def current_ssid() -> str:
     finally:
         _wlanapi.WlanCloseHandle(handle, None)
     return ""
+
+
+def _open() -> wintypes.HANDLE | None:
+    """打开一个 WLAN 句柄；失败返回 None。"""
+    if _wlanapi is None:
+        return None
+    handle = wintypes.HANDLE()
+    ver = wintypes.DWORD()
+    if _wlanapi.WlanOpenHandle(WLAN_CLIENT_VERSION, None,
+                               ctypes.byref(ver), ctypes.byref(handle)) != 0:
+        return None
+    return handle
+
+
+def _first_interface(handle):
+    """(接口信息, 接口列表指针)；调用方负责 WlanFreeMemory 释放列表。"""
+    plist = ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)()
+    if _wlanapi.WlanEnumInterfaces(handle, None, ctypes.byref(plist)) != 0:
+        return None, None
+    if int(plist.contents.dwNumberOfItems) <= 0:
+        _wlanapi.WlanFreeMemory(ctypes.cast(plist, ctypes.c_void_p))
+        return None, None
+    info = WLAN_INTERFACE_INFO.from_address(
+        ctypes.addressof(plist.contents.InterfaceInfo))
+    return info, plist
+
+
+def profiles() -> list[str]:
+    """这台电脑保存过的无线网络名（即"连过、记住密码"的那些）。"""
+    handle = _open()
+    if handle is None:
+        return []
+    try:
+        info, plist = _first_interface(handle)
+        if info is None:
+            return []
+        try:
+            out = ctypes.POINTER(WLAN_PROFILE_INFO_LIST)()
+            rc = _wlanapi.WlanGetProfileList(
+                handle, ctypes.byref(info.InterfaceGuid), None, ctypes.byref(out))
+            if rc != 0 or not out:
+                return []
+            try:
+                n = int(out.contents.dwNumberOfItems)
+                base = ctypes.addressof(out.contents.ProfileInfo)
+                step = ctypes.sizeof(WLAN_PROFILE_INFO)
+                return [WLAN_PROFILE_INFO.from_address(base + i * step).strProfileName
+                        for i in range(n)]
+            finally:
+                _wlanapi.WlanFreeMemory(ctypes.cast(out, ctypes.c_void_p))
+        finally:
+            _wlanapi.WlanFreeMemory(ctypes.cast(plist, ctypes.c_void_p))
+    except Exception:
+        return []
+    finally:
+        _wlanapi.WlanCloseHandle(handle, None)
+
+
+def connect(ssid: str) -> tuple[bool, str]:
+    """发起连接到已保存的无线网络。
+
+    只负责"发起"（毫秒级返回），连上没有由调用方靠 current_ssid() 复查 ——
+    在界面线程里阻塞等 DHCP 会卡住整个窗口。
+
+    用的就是 Windows 自己那份配置文件，所以这个网络必须在这台电脑上连过一次。
+    """
+    ssid = (ssid or "").strip()
+    if not ssid:
+        return False, "网络名为空"
+    handle = _open()
+    if handle is None:
+        return False, "打不开无线服务（WLAN AutoConfig 可能没启动）"
+    try:
+        info, plist = _first_interface(handle)
+        if info is None:
+            return False, "没有找到无线网卡"
+        try:
+            saved = profiles()
+            real = next((p for p in saved if p.strip().lower() == ssid.lower()), None)
+            if real is None:
+                return False, (f"这台电脑没保存过「{ssid}」的连接信息，"
+                               f"先在 Windows 里手动连一次并勾上自动连接")
+
+            raw = ssid.encode("utf-8")[:32]
+            dssid = DOT11_SSID()
+            dssid.uSSIDLength = len(raw)
+            for i, b in enumerate(raw):
+                dssid.ucSSID[i] = b
+
+            params = WLAN_CONNECTION_PARAMETERS()
+            params.wlanConnectionMode = WLAN_CONNECTION_MODE_PROFILE
+            params.strProfile = real
+            params.pDot11Ssid = ctypes.pointer(dssid)
+            params.pDesiredBssidList = None
+            params.dot11BssType = DOT11_BSS_TYPE_ANY
+            params.dwFlags = 0
+
+            rc = _wlanapi.WlanConnect(
+                handle, ctypes.byref(info.InterfaceGuid),
+                ctypes.byref(params), None)
+            if rc != 0:
+                return False, f"发起连接失败（错误码 {rc}）"
+            return True, f"已发起连接到「{real}」"
+        finally:
+            _wlanapi.WlanFreeMemory(ctypes.cast(plist, ctypes.c_void_p))
+    except Exception as e:
+        return False, f"连接出错：{e}"
+    finally:
+        _wlanapi.WlanCloseHandle(handle, None)
 
 
 def signal_quality() -> int:

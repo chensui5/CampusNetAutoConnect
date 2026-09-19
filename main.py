@@ -16,12 +16,27 @@ if not getattr(sys, "frozen", False) and _HERE not in sys.path:
 from core.config import ConfigManager, APP_TITLE  # noqa: E402
 
 # Chromium 的启动参数必须在 QApplication 之前设置。
+#
+# 这里最关键的是那几个 --disable-*-throttling：
+# Chromium 对"看不见的窗口"会挂起渲染、并给定时器降频。而本程序大量时间
+# 是缩在托盘里或最小化运行的 —— 一被节流，认证页那个 Vue 单页应用就永远
+# 渲染不完：账号密码框出来了，但"登录"按钮一直不出现，于是程序报
+# 「未找到可点击的登录按钮」，等用户把窗口一打开，按钮立刻就冒出来了。
+# 必须把节流关掉，后台才能正常把表单跑完。
+_NO_THROTTLE = (
+    "--disable-background-timer-throttling "
+    "--disable-backgrounding-occluded-windows "
+    "--disable-renderer-backgrounding "
+    "--disable-features=CalculateNativeWinOcclusion"
+)
+
 _cfg = ConfigManager()
-if _cfg.settings.browser_compat_mode:
-    _extra = "--no-sandbox --disable-gpu"
-    _old = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
-    if "--no-sandbox" not in _old:
-        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (_old + " " + _extra).strip()
+_flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+if _cfg.settings.browser_compat_mode and "--no-sandbox" not in _flags:
+    _flags = (_flags + " --no-sandbox --disable-gpu").strip()
+if "--disable-background-timer-throttling" not in _flags:
+    _flags = (_flags + " " + _NO_THROTTLE).strip()
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = _flags
 
 # 让内嵌浏览器也跟随系统缩放，避免高分屏下字体发虚
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")

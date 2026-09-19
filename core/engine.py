@@ -33,7 +33,8 @@ HIJACK_URLS = (
     "http://www.gstatic.com/generate_204",
 )
 
-MAX_INJECT_ROUND = 9      # 单个页面内最多尝试识别表单的次数（要等 SPA 渲染完）
+MAX_INJECT_ROUND = 9      # 表单已经出来了、只是按钮没渲染好 —— 值得多等
+MAX_NOFORM_ROUND = 4      # 连账号密码框都没有，多半这页不是登录页，别耗着
 MAX_VERIFY_ROUND = 3      # 提交后最多复查网络的次数
 
 
@@ -237,7 +238,14 @@ class ConnectEngine(QObject):
                 "detail": "完成" if ok else "加载失败",
                 "t": round(time.time() - self._t0, 1)})
             self.log.emit("页面加载" + ("完成" if ok else "失败"))
-            self._later(1500, self._pre_check)
+            if not ok:
+                # 页面根本打不开（没网 / DNS 挂了 / 连不上网关）。
+                # 这种情况下表单永远不会渲染出来，再等 9 轮纯属空转 ——
+                # 实测白耗 39 秒。直接换下一个候选地址。
+                self.log.emit("页面打不开，不等渲染了，直接换下一个候选地址")
+                self._next_candidate("页面加载失败")
+                return
+            self._later(1000, self._pre_check)
 
         self.view.loadFinished.connect(on_load)
         self._later(s.page_load_timeout * 1000, lambda: self._on_load_timeout(on_load))
@@ -313,13 +321,16 @@ class ConnectEngine(QObject):
                 self.log.emit("· " + str(m))
 
         if not res.get("found"):
-            if rnd < MAX_INJECT_ROUND - 1:
-                self.log.emit(f"这一轮还没看到登录表单，稍后再试（{rnd + 2}/{MAX_INJECT_ROUND}）"
-                              f"—— 页面还在渲染")
-                self.status.emit(f"等待页面渲染…（{rnd + 2}/{MAX_INJECT_ROUND}）")
-                self._later(700, lambda: self._inject(rnd + 1))
+            # 注意这里用的是 MAX_NOFORM_ROUND，不是 MAX_INJECT_ROUND：
+            # 「连账号密码框都没有」说明这一页多半就不是登录页，没必要耗 9 轮；
+            # 而「框有了、只是按钮还没渲染出来」才是真的在等 SPA，那才值得多等。
+            if rnd < MAX_NOFORM_ROUND - 1:
+                self.log.emit(f"这一轮还没看到账号密码框，稍后再试"
+                              f"（{rnd + 2}/{MAX_NOFORM_ROUND}）—— 页面还在渲染")
+                self.status.emit(f"等待页面渲染…（{rnd + 2}/{MAX_NOFORM_ROUND}）")
+                self._later(600, lambda: self._inject(rnd + 1))
                 return
-            self.log.emit("这个页面上确实没有账号/密码输入框")
+            self.log.emit("这个页面上没有账号/密码输入框，换个地址再试")
             self._next_candidate("页面上没有登录表单")
             return
 

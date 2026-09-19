@@ -34,6 +34,11 @@ from ui.neumorphism import (NeuButton, NeuLineEdit, NeuTextEdit, NeuPanel,
 
 ACCENT_ICON = "#6d5dfc"
 
+# 认证成功后的一段静默期：这段时间内不再响应自动触发。
+# 否则"开机自动"和"WiFi 触发"会几乎同时各跑一遍，第二次纯属白耗
+# （实测见过同一秒起了两个流程，第二个空转 12 秒）。
+SUCCESS_QUIET_SEC = 25
+
 
 def make_app_icon(color: str = ACCENT_ICON) -> QIcon:
     """自绘 WiFi 图标。"""
@@ -74,6 +79,8 @@ class MainWindow(QMainWindow):
         self._last_ssid = None
         self._last_wifi_probe = 0.0
         self._last_trigger_time = 0.0
+        self._last_wifi_connect_at = 0.0
+        self._last_success_at = 0.0
         self._trigger_ssid = ""
         self._wifi_probe_worker = None
         self.wifi_timer = QTimer(self)
@@ -133,7 +140,7 @@ class MainWindow(QMainWindow):
             delay = max(0, int(self.s.start_delay))
             self.append_log(f"将在 {delay} 秒后自动尝试连接…")
             QTimer.singleShot(delay * 1000,
-                              lambda: self._start_engine("启动自动") if not self._closing else None)
+                              lambda: self._start_engine("启动自动", auto=True) if not self._closing else None)
         elif not self.s.url:
             self.append_log("还没配置认证页地址，到【连接】页填好账号密码后点保存即可")
 
@@ -355,12 +362,26 @@ class MainWindow(QMainWindow):
         self.btn_external2 = NeuButton("外部浏览器")
         self.btn_shot2 = NeuButton("截图")
         self.btn_use_url = NeuButton("设为认证页")
+        self.cb_preview = NeuCheckBox("启用预览页")
         bh.addWidget(self.lbl_url, 1)
-        for b in (self.btn_go_auth, self.btn_use_url, self.btn_reload, self.btn_back,
-                  self.btn_external2, self.btn_shot2):
+        for b in (self.cb_preview, self.btn_go_auth, self.btn_use_url, self.btn_reload,
+                  self.btn_back, self.btn_external2, self.btn_shot2):
             bh.addWidget(b)
         lay.addWidget(bar)
-        lay.addWidget(self.view, 1)
+
+        # 网页放在一个容器里，靠「启用预览页」决定是显示它、还是只留一句说明。
+        # 关掉时 view 仍然是容器的子控件（只是隐藏）—— Chromium 照常跑 JS，
+        # 我们不需要那些像素，只需要页面把表单渲染出来。
+        self.preview_host = QWidget()
+        ph = QVBoxLayout(self.preview_host)
+        ph.setContentsMargins(0, 0, 0, 0)
+        self.preview_tip = self._label(
+            "预览已关闭 —— 浏览器在后台安静地跑，不再占用界面渲染\n"
+            "连接过程看【日志】页；想看网页就勾上左边的「启用预览页」",
+            "muted", 12)
+        self.preview_tip.setAlignment(Qt.AlignCenter)
+        self.preview_tip.setWordWrap(True)
+        lay.addWidget(self.preview_host, 1)
         v.addWidget(card, 1)
 
         self.btn_go_auth.clicked.connect(self._open_auth_page)
@@ -369,8 +390,36 @@ class MainWindow(QMainWindow):
         self.btn_external2.clicked.connect(self.open_external)
         self.btn_shot2.clicked.connect(self.save_screenshot)
         self.btn_use_url.clicked.connect(self._use_current_url)
+        self.cb_preview.toggled.connect(self._on_preview_toggled)
+        self._apply_preview_mode()
         self.view.urlChanged.connect(self._on_url_changed)
         return w
+
+    def _on_preview_toggled(self, on: bool):
+        self._dirty()
+        self._apply_preview_mode()
+        self.append_log("预览页已" + ("开启" if on else "关闭（浏览器转入后台，更省资源）"))
+
+    def _apply_preview_mode(self):
+        """按开关决定预览区显示网页、还是只留一句说明。"""
+        if not hasattr(self, "preview_host"):
+            return
+        enabled = bool(self.cb_preview.isChecked()) if hasattr(self, "cb_preview") else True
+        lay = self.preview_host.layout()
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.hide()
+        self.view.setParent(self.preview_host)      # 始终挂在容器下，保持存活
+        if enabled:
+            lay.addWidget(self.view)
+            self.view.show()
+        else:
+            lay.addWidget(self.preview_tip)
+            self.preview_tip.show()
+        if hasattr(self, "btn_shot2"):
+            self.btn_shot2.setEnabled(enabled)
 
     def _use_current_url(self):
         """在预览页手动翻到真正的登录页后，一键存为认证页地址。"""
@@ -571,6 +620,7 @@ class MainWindow(QMainWindow):
         # 网络触发（连上指定 WiFi 后才认证）
         c5, l5 = self._card("网络触发", "开机时 WiFi 还没连上，认证页打不开——这个功能就是等网络就绪")
         self.cb_wifi = NeuCheckBox("连上指定无线网络后自动认证")
+        self.cb_wifi_connect = NeuCheckBox("断线时自动连接校园网（需先在 Windows 里连过）")
         ssid_row = QWidget()
         sr = QHBoxLayout(ssid_row)
         sr.setContentsMargins(0, 0, 0, 0)
@@ -601,6 +651,7 @@ class MainWindow(QMainWindow):
 
         l5.addWidget(self.cb_wifi)
         l5.addWidget(self.cb_wifi_auto)
+        l5.addWidget(self.cb_wifi_connect)
         l5.addWidget(self._field("已识别的校园网", known_row))
         l5.addWidget(self._field("无线网络名", ssid_row))
         l5.addWidget(self._field("检查间隔", self.sp_wifi_interval))
@@ -665,6 +716,7 @@ class MainWindow(QMainWindow):
         self.btn_ssid_now.clicked.connect(self._use_current_ssid)
         self.cb_wifi_auto.toggled.connect(
             lambda _: (self._dirty(), self._refresh_known_ssids()))
+        self.cb_wifi_connect.toggled.connect(lambda _: self._dirty())
         self.btn_clear_known.clicked.connect(self._clear_known_ssids)
         self.cb_wifi.toggled.connect(lambda _: (self._dirty(), self._apply_wifi_watch()))
         self.sp_wifi_interval.valueChanged.connect(lambda _: (self._dirty(), self._apply_wifi_watch()))
@@ -819,6 +871,7 @@ class MainWindow(QMainWindow):
         self.cb_skip.setChecked(s.skip_if_online)
         self.cb_wifi.setChecked(s.wifi_trigger_enabled)
         self.cb_wifi_auto.setChecked(s.wifi_auto_detect)
+        self.cb_wifi_connect.setChecked(s.wifi_auto_connect)
         self.ed_ssid.setText(s.wifi_ssid)
         self.sp_wifi_interval.setValue(s.wifi_check_interval)
         self.sp_wifi_wait.setValue(s.wifi_wait)
@@ -840,6 +893,9 @@ class MainWindow(QMainWindow):
         {"dark": self.rb_dark, "light": self.rb_light,
          "system": self.rb_system}.get(s.theme, self.rb_light).setChecked(True)
         self._refresh_known_ssids()
+        if hasattr(self, "cb_preview"):
+            self.cb_preview.setChecked(s.preview_enabled)
+            self._apply_preview_mode()
         self._blocked = False
 
     def collect_from_ui(self) -> None:
@@ -871,6 +927,8 @@ class MainWindow(QMainWindow):
         s.wifi_trigger_enabled = self.cb_wifi.isChecked()
         s.wifi_ssid = self.ed_ssid.text().strip()
         s.wifi_auto_detect = self.cb_wifi_auto.isChecked()
+        s.wifi_auto_connect = self.cb_wifi_connect.isChecked()
+        s.preview_enabled = self.cb_preview.isChecked()
         # 注意：wifi_known_ssids 由 _learn_ssid() 直接维护，界面上没有对应控件
         s.wifi_check_interval = self.sp_wifi_interval.value()
         s.wifi_wait = self.sp_wifi_wait.value()
@@ -1151,6 +1209,9 @@ class MainWindow(QMainWindow):
     def on_finished(self, ok, msg):
         self.s.last_status = "成功" if ok else "失败"
         self.s.last_connect_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if ok:
+            # 记下成功时刻，供 _start_engine 的静默期使用
+            self._last_success_at = time.time()
         self.lbl_last.setText(f"上次：{self.s.last_connect_time} {self.s.last_status}")
         self._dirty()
         self.dot.set_color("success" if ok else "danger")
@@ -1256,10 +1317,74 @@ class MainWindow(QMainWindow):
         if fn:
             QTimer.singleShot(0, fn)
 
-    def _start_engine(self, reason: str, submit: bool = True):
+    def _start_engine(self, reason: str, submit: bool = True, auto: bool = False):
+        """启动一次认证流程。
+
+        auto=True 表示这是程序自己发起的（后台守护 / 无线触发 / 开机自动），
+        这种情况下会先做几道检查 —— 没连上该管的网络、或者刚刚才连成功，
+        就别再白跑一趟。用户手动点的（auto=False）一律放行，最多是快速失败。
+        """
+        if auto:
+            quiet = time.time() - getattr(self, "_last_success_at", 0.0)
+            if quiet < SUCCESS_QUIET_SEC:
+                self.append_log(f"刚认证成功 {quiet:.0f} 秒，这次自动触发跳过（{reason}）")
+                return
+            if not self._wifi_preflight(reason):
+                return
         self._ensure_browser(lambda: self.engine.start(reason, submit))
 
     # ==================== 无线网络触发 ====================
+    def _wifi_preflight(self, reason: str) -> bool:
+        """自动认证之前先看一眼无线网络状态。返回 True = 可以开始。
+
+        有无线网卡但没连任何网络时，打开认证页必然失败；
+        这时如果开了「断线时自动连接校园网」，就去把它连回来，
+        然后等 WiFi 触发那条路接管。
+        """
+        if not getattr(self, "_has_wifi", False):
+            return True                     # 没有无线网卡（比如插网线的台式机）
+        try:
+            ssid = wifi.current_ssid()
+        except Exception:
+            return True
+        if ssid:
+            if not self._accept_ssid(ssid):
+                self.append_log(f"当前网络「{ssid}」不在授权名单里，跳过这次自动认证")
+                return False
+            return True
+        # —— 没连任何无线网络 ——
+        self.append_log(f"当前没有连接无线网络，先不认证（触发来源：{reason}）")
+        if self._wifi_autoconnect_on():
+            self._try_wifi_connect()
+        else:
+            self.set_status("未连接无线网络")
+        return False
+
+    def _try_wifi_connect(self):
+        """掉线时，用 Windows 里保存的配置把校园网连回来。"""
+        if not getattr(self, "_has_wifi", False) or not self._wifi_autoconnect_on():
+            return
+        try:
+            if wifi.current_ssid():
+                return                      # 已经连上了，不用管
+        except Exception:
+            return
+        targets = self._wifi_targets()
+        if not targets:
+            self.append_log("还不认识校园网，没法自动连接 —— 先在 Windows 里手动连一次")
+            return
+        want = self._manual_ssid() or sorted(targets)[0]
+        now = time.time()
+        if now - getattr(self, "_last_wifi_connect_at", 0.0) < 30:
+            return                          # 30 秒内别反复试
+        self._last_wifi_connect_at = now
+        ok, msg = wifi.connect(want)
+        if ok:
+            self.append_log(f"检测到无线网络断开，正在自动连回「{want}」…")
+            self.set_status(f"正在连接 {want}…")
+        else:
+            self.append_log(f"自动连接「{want}」没成功：{msg}")
+
     def _check_wifi_hardware(self):
         try:
             self._has_wifi = bool(wifi.available() and wifi.interfaces())
@@ -1269,6 +1394,9 @@ class MainWindow(QMainWindow):
             self.s.wifi_trigger_enabled = False
             self.cb_wifi.setChecked(False)
             self.cb_wifi.setEnabled(False)
+            self.cb_wifi_auto.setEnabled(False)
+            self.cb_wifi_connect.setEnabled(False)
+            self.btn_clear_known.setEnabled(False)
             self.ed_ssid.setEnabled(False)
             self.btn_ssid_now.setEnabled(False)
             self.sp_wifi_interval.setEnabled(False)
@@ -1332,6 +1460,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, "ed_ssid"):
             return (self.ed_ssid.text() or "").strip()
         return (self.s.wifi_ssid or "").strip()
+
+    def _wifi_autoconnect_on(self) -> bool:
+        """「断线时自动连接校园网」开关 —— 以界面为准（配置要等防抖落盘）。"""
+        if hasattr(self, "cb_wifi_connect"):
+            return bool(self.cb_wifi_connect.isChecked())
+        return bool(getattr(self.s, "wifi_auto_connect", False))
 
     def _wifi_targets(self) -> set:
         """当前"该管"的无线网络集合（小写）。
@@ -1425,6 +1559,10 @@ class MainWindow(QMainWindow):
             return
         if not ssid:
             self._last_ssid = ""
+            # 掉线了：如果开了「断线时自动连接校园网」，就把它连回来。
+            # 连上之后会走上面「刚连上」那条路，自动认证。
+            if self._wifi_autoconnect_on():
+                self._try_wifi_connect()
             return
         if not self._accept_ssid(ssid):
             self._last_ssid = ssid
@@ -1499,7 +1637,7 @@ class MainWindow(QMainWindow):
             return
         self.append_log(f"开始自动认证（触发来源：{ssid}）")
         self._trigger_ssid = ssid          # 成功后拿它去记名
-        self._start_engine(f"WiFi 触发（{ssid}）")
+        self._start_engine(f"WiFi 触发（{ssid}）", auto=True)
 
     # ==================== 后台守护 ====================
     def toggle_watchdog(self):
@@ -1533,7 +1671,7 @@ class MainWindow(QMainWindow):
         if online:
             return
         self.append_log(f"后台检测到网络不通（{detail}），尝试自动重连")
-        self._start_engine("后台自动重连")
+        self._start_engine("后台自动重连", auto=True)
 
     # ==================== 日志 ====================
     def append_log(self, level_or_line, line=None):

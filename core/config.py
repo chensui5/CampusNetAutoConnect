@@ -17,7 +17,7 @@ from .crypto import protect_text, unprotect_text
 
 APP_NAME = "CampusNetAutoConnect"
 APP_TITLE = "校园网自动连接"
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 AUTHOR = "尘遂"
 
 
@@ -60,6 +60,7 @@ class Settings:
     wifi_trigger_enabled: bool = True   # 连上指定无线网络后自动认证
     wifi_ssid: str = ""                 # 目标 WiFi 名（留空=任意无线网络）
     wifi_auto_detect: bool = True       # 自动识别校园网：检测到需要认证的网络就记下名字
+    wifi_auto_connect: bool = False     # 掉线时自动连回校园网（需 Windows 里存过该网络）
     wifi_known_ssids: list = field(default_factory=list)  # 已识别出的校园网名
     wifi_check_interval: int = 4        # 检查间隔（秒）
     wifi_net_check_interval: int = 15   # 网络是否可用的复查间隔（秒）
@@ -78,6 +79,7 @@ class Settings:
 
     # —— 页面交互 ——
     browser_compat_mode: bool = True  # 关闭 Chromium 沙箱，兼容受限环境
+    preview_enabled: bool = True      # 显示预览页；关掉后浏览器只在后台跑，不上屏
     auto_submit: bool = True         # 填完自动点登录
     page_load_timeout: int = 25      # 页面加载超时（秒）
     post_submit_wait: int = 4        # 提交后等待 N 秒再复查网络
