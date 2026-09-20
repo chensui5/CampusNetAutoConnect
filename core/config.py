@@ -17,7 +17,7 @@ from .crypto import protect_text, unprotect_text
 
 APP_NAME = "CampusNetAutoConnect"
 APP_TITLE = "校园网自动连接"
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.10.1"
 AUTHOR = "尘遂"
 
 
