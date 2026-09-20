@@ -356,8 +356,8 @@ class ConnectEngine(QObject):
 
         if not res.get("submitted"):
             if rnd < MAX_INJECT_ROUND - 1:
-                why = ("页面还停在「单点登录 / 扫码」这类模式，等它切到账号登录"
-                       if res.get("modeSwitch") else "登录按钮还没出现")
+                # modeSwitch 在这个 portal 上永远是 true（"单点登录"入口常驻），不能拿它判断
+                why = "登录按钮还没出现"
                 self.log.emit(f"{why}，稍后再试（{rnd + 2}/{MAX_INJECT_ROUND}）")
                 self.status.emit("等待页面就绪…")
                 self._later(800, lambda: self._inject(rnd + 1))

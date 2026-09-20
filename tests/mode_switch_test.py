@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""复现用户遇到的场景：页面刚打开时停在「单点登录」模式，账号登录按钮还没渲染出来。
+"""复现：登录按钮一开始是隐藏的（display:none）。
 
-程序以前会退而求其次去点「单点登录」那个 span（那其实是模式切换按钮，点了等于白点）。
-现在应该：等页面切到账号登录模式，再点真正的 #login-account。
+程序不应该去点「单点登录」那个 span（那是切到别的认证方式），
+但也不该干等按钮出现 —— 账号密码已填好时，直接程序化点隐藏的 #login-account 即可。
 """
 
 from __future__ import annotations
@@ -144,9 +144,8 @@ def main():
         joined = "\n".join(logs)
         checks = [
             ("识别到「单点登录」是模式切换按钮，没去点它", "点了单点登录" not in store),
-            ("等页面切到账号登录模式（有重试日志）",
-             "单点登录" in joined and "稍后再试" in joined),
-            ("最终点到的是 #login-account", "按钮=#login-account" in joined),
+            ("直接点了隐藏的登录按钮（不再干等 2 秒）", "直接点击它" in joined),
+            ("最终点到的是 #login-account", "login-account" in joined),
             ("账号密码填对了", "user=20250001" in store and "pwd=mypassword888" in store),
             ("引擎判定成功", result["ok"] is True),
         ]

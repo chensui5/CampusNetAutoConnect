@@ -30,7 +30,7 @@ AUTOFILL_JS = r"""
   var out = {
     found: false, filled: false, submitted: false, captcha: false,
     hasForm: false, modeSwitch: false, domainSel: "", msg: [],
-    userSel: "", pwdSel: "", btnSel: "",
+    userSel: "", pwdSel: "", btnSel: "", looseBtn: false, forcedBtn: false,
     userValue: "", title: document.title, url: location.href,
     inputCount: 0
   };
@@ -47,6 +47,15 @@ AUTOFILL_JS = r"""
       if (parseFloat(s.opacity) === 0) return false;
       var r = el.getBoundingClientRect();
       return r.width > 0 && r.height > 0;
+    } catch (e) { return true; }
+  }
+
+  function looseVisible(el) {
+    // 比 visible 宽松：不查 opacity/尺寸。开机时窗口隐藏，CSS 动画不跑，按钮卡在 opacity:0
+    if (!el) return false;
+    try {
+      var s = getComputedStyle(el);
+      return s.display !== 'none' && s.visibility !== 'hidden';
     } catch (e) { return true; }
   }
 
@@ -198,6 +207,13 @@ AUTOFILL_JS = r"""
       var el = q(document, sure[i]);
       if (el && visible(el) && !isModeSwitch(el)) { out.btnSel = sure[i]; return el; }
     }
+    // 第二遍：放宽可见性 —— 开机时窗口隐藏、CSS 动画没跑，按钮可能卡在 opacity:0
+    for (var i2 = 0; i2 < sure.length; i2++) {
+      var el2 = q(document, sure[i2]);
+      if (el2 && looseVisible(el2) && !isModeSwitch(el2)) {
+        out.btnSel = sure[i2]; out.looseBtn = true; return el2;
+      }
+    }
     // 页面上是不是压根还没切到"账号登录"模式？
     var sw = qa(document, 'span, a, div, button').filter(function (el) {
       return visible(el) && /单点|sso|扫码|短信|其他方式/.test(
@@ -220,6 +236,17 @@ AUTOFILL_JS = r"""
     }
     cand.sort(function (a, b) { return scoreButton(b) - scoreButton(a); });
     if (cand.length) { out.btnSel = describe(cand[0]); return cand[0]; }
+
+    // 兜底：账号密码已填但按钮"不可见"，直接按 id 点下去（.click() 对隐藏元素也有效）
+    if (out.filled) {
+      var fb = q(document, '#login-account') || q(document, '#loginBtn') ||
+               q(document, '#login-btn') || q(document, 'button[class*=btn-login]');
+      if (fb && !isModeSwitch(fb)) {
+        out.btnSel = describe(fb); out.forcedBtn = true;
+        log('登录按钮在页面上但被判定为不可见，直接点击它');
+        return fb;
+      }
+    }
     return null;
   }
 
