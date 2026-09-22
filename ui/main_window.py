@@ -26,7 +26,8 @@ from core.config import (ConfigManager, APP_TITLE, APP_VERSION, AUTHOR,
                          app_data_dir, logs_dir, backgrounds_dir)
 from core.engine import ConnectEngine, ProbeWorker
 from core.logger import get_logger
-from core import autostart, wifi
+from core import autostart, netstat, wifi
+from core.speedtest import SpeedTestWorker
 from ui.theme import apply_theme
 from ui import neumorphism as neu
 from ui.neumorphism import (NeuButton, NeuLineEdit, NeuTextEdit, NeuPanel,
@@ -91,9 +92,7 @@ class MainWindow(QMainWindow):
         self._browser_ready = False
         self._browser_starting = False
         self._pending_browser_action = None
-        self.view = QWebEngineView()
-        self.view.setMinimumHeight(260)
-        self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.view = self._make_view()
 
         # —— 引擎 ——
         self.engine = ConnectEngine(cfg, self.view, self)
@@ -101,7 +100,6 @@ class MainWindow(QMainWindow):
         self.engine.status.connect(self.set_status)
         self.engine.finished.connect(self.on_finished)
         self.engine.need_manual.connect(self.on_need_manual)
-        self.view.loadFinished.connect(self._on_page_loaded)
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -249,6 +247,7 @@ class MainWindow(QMainWindow):
         self.tabs.setTabBar(NeuTabBar())
         self.tabs.addTab(self._wrap_scroll(self._build_connect_tab()), "连接")
         self.tabs.addTab(self._build_preview_tab(), "预览")
+        self.tabs.addTab(self._wrap_scroll(self._build_net_tab()), "网络")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.addTab(self._wrap_scroll(self._build_appearance_tab()), "外观")
         self.tabs.addTab(self._wrap_scroll(self._build_advanced_tab()), "高级")
@@ -386,14 +385,13 @@ class MainWindow(QMainWindow):
         v.addWidget(card, 1)
 
         self.btn_go_auth.clicked.connect(self._open_auth_page)
-        self.btn_reload.clicked.connect(self.view.reload)
-        self.btn_back.clicked.connect(self.view.back)
+        self.btn_reload.clicked.connect(lambda: self.view and self.view.reload())
+        self.btn_back.clicked.connect(lambda: self.view and self.view.back())
         self.btn_external2.clicked.connect(self.open_external)
         self.btn_shot2.clicked.connect(self.save_screenshot)
         self.btn_use_url.clicked.connect(self._use_current_url)
         self.cb_preview.toggled.connect(self._on_preview_toggled)
         self._apply_preview_mode()
-        self.view.urlChanged.connect(self._on_url_changed)
         return w
 
     def _on_preview_toggled(self, on: bool):
@@ -412,8 +410,9 @@ class MainWindow(QMainWindow):
             w = it.widget()
             if w is not None:
                 w.hide()
-        self.view.setParent(self.preview_host)      # 始终挂在容器下，保持存活
-        if enabled:
+        if self.view is not None:
+            self.view.setParent(self.preview_host)  # 始终挂在容器下，保持存活
+        if enabled and self.view is not None:
             lay.addWidget(self.view)
             self.view.show()
         else:
@@ -424,6 +423,9 @@ class MainWindow(QMainWindow):
 
     def _use_current_url(self):
         """在预览页手动翻到真正的登录页后，一键存为认证页地址。"""
+        if self.view is None:
+            QMessageBox.information(self, "提示", "浏览器还没启动，先打开一次认证页")
+            return
         u = self.view.url().toString()
         if not u or u.startswith("about:") or u.startswith("data:"):
             QMessageBox.information(self, "提示", "当前还没有打开任何页面")
@@ -435,8 +437,15 @@ class MainWindow(QMainWindow):
         self.set_status("认证页地址已更新")
 
     def _on_tab_changed(self, idx):
-        if self.tabs.tabText(idx) == "预览" and not getattr(self, "_browser_ready", False):
+        name = self.tabs.tabText(idx)
+        if name == "预览" and not getattr(self, "_browser_ready", False):
             self._ensure_browser(lambda: None)
+        if hasattr(self, "net_timer"):
+            if name == "网络":
+                self._refresh_conns()
+                self.net_timer.start()
+            else:
+                self.net_timer.stop()
 
     def _on_url_changed(self, url):
         if hasattr(self, "lbl_url"):
@@ -673,6 +682,7 @@ class MainWindow(QMainWindow):
         self.cb_submit = NeuCheckBox("填完自动点击登录")
         self.cb_remember = NeuCheckBox("自动勾选“记住我 / 同意协议”")
         self.cb_close_page = NeuCheckBox("连接成功后清空预览页面")
+        self.cb_release = NeuCheckBox("连接成功后释放内置浏览器（省内存，重连稍慢）")
         l4.addWidget(self._field("运营商", self.ed_domain))
         l4.addWidget(self._field("账号框", self.ed_sel_user))
         l4.addWidget(self._field("密码框", self.ed_sel_pwd))
@@ -680,6 +690,7 @@ class MainWindow(QMainWindow):
         l4.addWidget(self.cb_submit)
         l4.addWidget(self.cb_remember)
         l4.addWidget(self.cb_close_page)
+        l4.addWidget(self.cb_release)
         l4.addStretch(1)
 
         grid.addWidget(c1, 0, 0)   # 启动行为
@@ -711,6 +722,7 @@ class MainWindow(QMainWindow):
         for x in (self.cb_auto_connect, self.cb_minimized, self.cb_tray, self.cb_reconnect,
                   self.cb_compat, self.cb_skip, self.cb_remember, self.cb_close_page, self.cb_submit):
             x.toggled.connect(lambda _: self._dirty())
+        self.cb_release.toggled.connect(self._on_release_toggled)
         for x in (self.sp_delay, self.sp_interval, self.sp_retry, self.sp_retry_delay,
                   self.sp_timeout, self.sp_wait, self.sp_probe_timeout):
             x.valueChanged.connect(lambda _: self._dirty())
@@ -773,6 +785,126 @@ class MainWindow(QMainWindow):
             self.append_log(f"复制失败：{e}")
 
     # ---------- 关于页 ----------
+    # ---------- 网络工具页 ----------
+    def _build_net_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(9, 9, 9, 9)
+        v.setSpacing(4)
+
+        card, lay = self._card("测速", "点一下测下载速度与延迟；默认走教育网源，可多行填、逐个尝试")
+        self.ed_speed_url = NeuTextEdit()
+        self.ed_speed_url.setPlainText(self.s.speedtest_url)
+        self.ed_speed_url.setMinimumHeight(66)
+        self.ed_speed_url.setMaximumHeight(96)
+        lay.addWidget(self._field("测速地址", self.ed_speed_url))
+
+        row = QWidget()
+        rh = QHBoxLayout(row)
+        rh.setContentsMargins(0, 0, 0, 0)
+        rh.setSpacing(12)
+        self.btn_speed = NeuButton("开始测速")
+        self.btn_speed.clicked.connect(self._run_speedtest)
+        self.cb_speed_unit = NeuComboBox()
+        self.cb_speed_unit.addItems(["Mbps", "MB/s", "KB/s"])
+        self.cb_speed_unit.currentTextChanged.connect(self._on_speed_unit_changed)
+        self.lb_speed = self._label("未测速", "muted", 12)
+        rh.addWidget(self.btn_speed)
+        rh.addWidget(self.cb_speed_unit)
+        rh.addWidget(self.lb_speed, 1)
+        lay.addWidget(row)
+        v.addWidget(card)
+
+        card2, lay2 = self._card("谁在联网", "当前打开的网络连接，按进程汇总（每 2 秒刷新）")
+        self.lb_netrate = self._label("统计中…", "muted", 12)
+        lay2.addWidget(self.lb_netrate)
+        self.txt_conn = NeuTextEdit()
+        self.txt_conn.setReadOnly(True)
+        self.txt_conn.setMinimumHeight(220)
+        self.txt_conn.setFont(QFont("Consolas", 9))
+        lay2.addWidget(self.txt_conn)
+        row2 = QWidget()
+        rh2 = QHBoxLayout(row2)
+        rh2.setContentsMargins(0, 0, 0, 0)
+        self.btn_refresh = NeuButton("立即刷新")
+        self.btn_refresh.clicked.connect(self._refresh_conns)
+        rh2.addWidget(self.btn_refresh)
+        rh2.addStretch(1)
+        lay2.addWidget(row2)
+        v.addWidget(card2)
+
+        self._speed_worker = None
+        self._net_prev = None
+        self.net_timer = QTimer(self)
+        self.net_timer.setInterval(2000)
+        self.net_timer.timeout.connect(self._refresh_conns)
+        return w
+
+    def _fmt_speed(self, mbps: float) -> str:
+        u = self.cb_speed_unit.currentText() if hasattr(self, "cb_speed_unit") else "Mbps"
+        if u == "MB/s":
+            return f"{mbps / 8:.2f} MB/s"
+        if u == "KB/s":
+            return f"{mbps * 125:.0f} KB/s"
+        return f"{mbps:.1f} Mbps"
+
+    def _on_speed_unit_changed(self, text):
+        self.s.speed_unit = text
+        self._dirty()
+
+    def _run_speedtest(self):
+        if self._speed_worker and self._speed_worker.isRunning():
+            return
+        url = self.ed_speed_url.toPlainText().strip()
+        self.s.speedtest_url = url
+        self._dirty()
+        self.btn_speed.setEnabled(False)
+        self.lb_speed.setText("测速中…（最多 8 秒）")
+        w = SpeedTestWorker(url, seconds=8, parent=self)
+        self._speed_worker = w
+        w.live.connect(lambda m: self.lb_speed.setText(f"测速中… {self._fmt_speed(m)}"))
+        w.done.connect(self._on_speed_done)
+        w.failed.connect(self._on_speed_failed)
+        w.finished.connect(lambda: self.btn_speed.setEnabled(True))
+        w.start()
+
+    def _on_speed_done(self, d):
+        self.lb_speed.setText(f"↓ {self._fmt_speed(d['mbps'])} · 延迟 {d['latency_ms']:.0f} ms · "
+                              f"下载 {d['mb']:.1f} MB / {d['sec']:.1f}s")
+        self.append_log(f"测速：↓{self._fmt_speed(d['mbps'])}，延迟 {d['latency_ms']:.0f} ms")
+
+    def _on_speed_failed(self, err):
+        self.lb_speed.setText(f"测速失败：{err}")
+        self.append_log(f"测速失败：{err}")
+
+    def _refresh_conns(self):
+        try:
+            conns = netstat.list_connections()
+            tin, tout = netstat.io_totals()
+        except Exception as e:
+            self.txt_conn.setPlainText(f"读取失败：{e}")
+            return
+        now = time.time()
+        head = f"共 {len(conns)} 条连接"
+        if self._net_prev:
+            pt, pin, pout = self._net_prev
+            dt = max(0.001, now - pt)
+            head = (f"↓ {self._fmt_speed((tin - pin) * 8 / dt / 1e6)}   "
+                    f"↑ {self._fmt_speed((tout - pout) * 8 / dt / 1e6)}   ·   {head}")
+        self._net_prev = (now, tin, tout)
+        self.lb_netrate.setText(head)
+
+        by: dict[str, dict] = {}
+        for c in conns:
+            e = by.setdefault(c["proc"], {"n": 0, "remote": ""})
+            e["n"] += 1
+            if not e["remote"] and c["remote"] != "*:*":
+                e["remote"] = c["remote"]
+        lines = [f"{'连接':>4}  {'进程':<26} 远端", "-" * 62]
+        for name, e in sorted(by.items(), key=lambda x: -x[1]["n"]):
+            lines.append(f"{e['n']:>4}  {name[:26]:<26} {e['remote']}")
+        self.txt_conn.setPlainText("\n".join(lines))
+
     def _build_about_tab(self):
         w = QWidget()
         v = QVBoxLayout(w)
@@ -883,6 +1015,7 @@ class MainWindow(QMainWindow):
         self.cb_submit.setChecked(s.auto_submit)
         self.cb_remember.setChecked(s.remember_checkbox)
         self.cb_close_page.setChecked(s.close_page_after_success)
+        self.cb_release.setChecked(s.release_browser)
         self.cb_bg.setChecked(s.bg_enabled)
         self.sl_dim.setValue(s.bg_dim)
         self.sl_blur.setValue(s.bg_blur)
@@ -897,6 +1030,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, "cb_preview"):
             self.cb_preview.setChecked(s.preview_enabled)
             self._apply_preview_mode()
+        if hasattr(self, "ed_speed_url"):
+            self.ed_speed_url.setPlainText(s.speedtest_url)
+        if hasattr(self, "cb_speed_unit"):
+            self.cb_speed_unit.setCurrentText(s.speed_unit)
         self._blocked = False
 
     def collect_from_ui(self) -> None:
@@ -940,11 +1077,16 @@ class MainWindow(QMainWindow):
         s.auto_submit = self.cb_submit.isChecked()
         s.remember_checkbox = self.cb_remember.isChecked()
         s.close_page_after_success = self.cb_close_page.isChecked()
+        s.release_browser = self.cb_release.isChecked()
         s.bg_enabled = self.cb_bg.isChecked()
         s.bg_dim = self.sl_dim.value()
         s.bg_blur = self.sl_blur.value()
         s.bg_fit = self.cb_fit.currentData() or "cover"
         s.auto_start = self.cb_autostart.isChecked()
+        if hasattr(self, "ed_speed_url"):
+            s.speedtest_url = self.ed_speed_url.toPlainText().strip()
+        if hasattr(self, "cb_speed_unit"):
+            s.speed_unit = self.cb_speed_unit.currentText()
         s.first_run = False
 
     def save_from_ui(self, force=False):
@@ -1219,7 +1361,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "_test_mode", False):
             self._test_mode = False
             self.show_report(ok, msg)
-        if ok and self.s.close_page_after_success:
+        if ok and self.s.close_page_after_success and self.view is not None:
             self.view.setUrl(QUrl("about:blank"))
         if ok:
             # 认证成功 —— 这就是校园网，把它的名字记下来，下次不用再猜
@@ -1228,6 +1370,9 @@ class MainWindow(QMainWindow):
                 self._trigger_ssid = ""
             self.tray.showMessage(APP_TITLE, f"校园网已连接：{msg}",
                                   QSystemTrayIcon.Information, 2500)
+            # 连上后若不需要盯着预览页，就释放浏览器省内存（需要时自动重建）
+            if self.s.release_browser and self.tabs.tabText(self.tabs.currentIndex()) != "预览":
+                QTimer.singleShot(1500, self._release_browser)
         else:
             self.tray.showMessage(APP_TITLE, f"连接失败：{msg}\n详情看【日志】页",
                                   QSystemTrayIcon.Warning, 4000)
@@ -1282,14 +1427,60 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.append_log(f"截图失败：{e}")
 
-    # ==================== 浏览器（延迟启动） ====================
+    # ==================== 浏览器（延迟启动 / 可释放） ====================
+    def _make_view(self) -> QWebEngineView:
+        view = QWebEngineView()
+        view.setMinimumHeight(260)
+        view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        view.loadFinished.connect(self._on_page_loaded)
+        view.urlChanged.connect(self._on_url_changed)
+        return view
+
+    def _recreate_view(self):
+        self.view = self._make_view()
+        self.engine.view = self.view
+        self._apply_preview_mode()
+        self.append_log("内置浏览器已重建")
+
+    def _release_browser(self):
+        """关掉内嵌浏览器，释放 Chromium 渲染进程的内存（下次用会自动重建）。"""
+        if self.view is None or not getattr(self, "_browser_ready", False):
+            return
+        view, page = self.view, self.view.page()
+        try:
+            view.hide()
+            view.setParent(None)
+            view.deleteLater()
+            if page is not None:
+                page.deleteLater()
+        except Exception as e:
+            self.append_log(f"释放浏览器失败：{e}")
+            return
+        self.view = None
+        self.engine.view = None
+        self._browser_ready = False
+        self._browser_starting = False
+        self._pending_browser_action = None
+        self._apply_preview_mode()
+        self.append_log("已释放内置浏览器（省内存，下次连接自动重建）")
+
+    def _on_release_toggled(self, on: bool):
+        self._dirty()
+        # 当场生效：勾上就释放，不用等下次连接
+        if on and self.tabs.tabText(self.tabs.currentIndex()) != "预览":
+            self._release_browser()
+        elif not on and self.view is None:
+            self._ensure_browser(lambda: None)
+
     def _ensure_browser(self, on_ready):
-        """需要浏览器时再启动它。
+        """需要浏览器时再启动它（被释放过就重建）。
 
         首次访问 view.page() 会让 Chromium 内核初始化，实测要 1.3 秒，
         放在启动路径上就会变成"打开后卡几秒"。所以改成：
         窗口先显示出来，真正要用浏览器的时候（或切到预览页时）再初始化。
         """
+        if self.view is None:
+            self._recreate_view()
         if getattr(self, "_browser_ready", False):
             on_ready()
             return

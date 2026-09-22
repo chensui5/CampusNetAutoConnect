@@ -77,6 +77,14 @@ class Settings:
     skip_if_online: bool = True      # 已联网就跳过连接流程
     probe_timeout: int = 5
 
+    # —— 网络工具页 ——（测速地址，多行逐个尝试）
+    speedtest_url: str = (
+        "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso\n"
+        "https://mirrors.ustc.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-desktop-amd64.iso\n"
+        "https://speed.cloudflare.com/__down?bytes=104857600"
+    )
+    speed_unit: str = "Mbps"           # 速度显示单位：Mbps / MB/s / KB/s
+
     # —— 页面交互 ——
     browser_compat_mode: bool = True  # 关闭 Chromium 沙箱，兼容受限环境
     preview_enabled: bool = True      # 显示预览页；关掉后浏览器只在后台跑，不上屏
@@ -89,6 +97,7 @@ class Settings:
     domain: str = ""                 # 运营商 / 产品（如 联通、@telecom），留空按页面默认
     remember_checkbox: bool = True   # 勾选"记住我/同意"类复选框
     close_page_after_success: bool = False  # 成功后关闭内嵌页面
+    release_browser: bool = False    # 成功后释放内嵌浏览器（省内存；下次连接自动重建）
 
     # —— 外观 ——
     theme: str = "dark"              # dark / light / system
@@ -146,6 +155,10 @@ class ConfigManager:
         if (s.probe_url or "").strip() == legacy_probe:
             # 单一探测点在校园网里太容易误判，升级成多探测点
             s.probe_url = Settings().probe_url
+        legacy_speed = "https://speed.cloudflare.com/__down?bytes=104857600"
+        if (s.speedtest_url or "").strip() == legacy_speed:
+            # 境外测速源在校园网常连不上，升级成教育网多源
+            s.speedtest_url = Settings().speedtest_url
 
     def save(self) -> bool:
         try:
